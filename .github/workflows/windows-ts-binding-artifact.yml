@@ -1,0 +1,114 @@
+name: Windows TS Binding Artifact
+
+on:
+  push:
+    branches:
+      - public-windows-artifacts
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NODE_VERSION: "20"
+
+jobs:
+  windows-ts-binding:
+    name: Build Windows TS native binding
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      NPM_CONFIG_CACHE: ${{ runner.temp }}\npm-cache
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "27.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --target x86_64-pc-windows-msvc
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore cargo cache
+        id: cargo-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-ts-binding-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            windows-ts-sdk-cargo-${{ hashFiles('Cargo.lock') }}
+            npm-x86_64-pc-windows-msvc-${{ hashFiles('Cargo.lock') }}
+            windows-ts-binding-cargo-
+            windows-ts-sdk-cargo-
+            npm-x86_64-pc-windows-msvc-
+
+      - name: Restore npm cache
+        id: npm-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.NPM_CONFIG_CACHE }}
+          key: windows-ts-binding-npm-${{ hashFiles('crates/nanograph-ts/package.json', 'package-lock.json') }}
+          restore-keys: |
+            windows-ts-binding-npm-
+
+      - name: Install npm deps
+        working-directory: crates/nanograph-ts
+        run: npm install --ignore-scripts
+
+      - name: Build .node binary
+        working-directory: crates/nanograph-ts
+        run: npx napi build --platform --js index.js --release --target x86_64-pc-windows-msvc
+
+      - name: Verify native binding
+        working-directory: crates/nanograph-ts
+        shell: pwsh
+        run: |
+          $binding = Join-Path $PWD 'nanograph.win32-x64-msvc.node'
+          if (-not (Test-Path -LiteralPath $binding)) {
+            throw "missing Windows native binding: $binding"
+          }
+          node -e "const ng=require('.'); if (typeof ng.Database !== 'function') throw new Error('Database export missing'); console.log(typeof ng.Database)"
+          $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $binding
+          "$($hash.Hash.ToLowerInvariant())  nanograph.win32-x64-msvc.node" |
+            Set-Content -NoNewline -Path "$binding.sha256"
+
+      - name: Upload Windows TS native binding
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanograph-ts-win32-x64-msvc-node
+          path: |
+            crates/nanograph-ts/nanograph.win32-x64-msvc.node
+            crates/nanograph-ts/nanograph.win32-x64-msvc.node.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Save cargo cache
+        if: always() && steps.cargo-cache.outputs.cache-hit != 'true' && steps.cargo-cache.outputs.cache-primary-key != ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+      - name: Save npm cache
+        if: always() && steps.npm-cache.outputs.cache-hit != 'true' && steps.npm-cache.outputs.cache-primary-key != ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.NPM_CONFIG_CACHE }}
+          key: ${{ steps.npm-cache.outputs.cache-primary-key }}

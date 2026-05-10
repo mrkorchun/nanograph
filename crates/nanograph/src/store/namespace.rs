@@ -72,6 +72,10 @@ pub(crate) fn local_path_to_file_uri(path: &Path) -> Result<String> {
 }
 
 fn namespace_location_to_absolute_local_path(location: &str) -> Result<PathBuf> {
+    if let Some(path) = absolute_local_path_literal(location) {
+        return Ok(path);
+    }
+
     if let Ok(url) = Url::parse(location) {
         if url.scheme() == "file" {
             return url.to_file_path().map_err(|_| {
@@ -88,15 +92,15 @@ fn namespace_location_to_absolute_local_path(location: &str) -> Result<PathBuf> 
         )));
     }
 
-    let path = PathBuf::from(location);
-    if path.is_absolute() {
-        return Ok(path);
-    }
-
     Err(NanoError::Lance(format!(
         "namespace location is not an absolute local path: {}",
         location
     )))
+}
+
+fn absolute_local_path_literal(location: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(location);
+    if path.is_absolute() { Some(path) } else { None }
 }
 
 pub(crate) fn namespace_location_to_local_path(db_dir: &Path, location: &str) -> Result<PathBuf> {
@@ -109,6 +113,10 @@ pub(crate) fn namespace_location_to_local_path(db_dir: &Path, location: &str) ->
 }
 
 pub(crate) fn namespace_location_to_dataset_uri(db_dir: &Path, location: &str) -> Result<String> {
+    if let Some(path) = absolute_local_path_literal(location) {
+        return local_path_to_file_uri(&path);
+    }
+
     if let Ok(url) = Url::parse(location) {
         return Ok(url.to_string());
     }
@@ -304,6 +312,10 @@ pub(crate) async fn namespace_latest_version_optional(
 }
 
 fn namespace_location_to_absolute_dataset_uri(location: &str) -> Result<String> {
+    if let Some(path) = absolute_local_path_literal(location) {
+        return local_path_to_file_uri(&path);
+    }
+
     if let Ok(url) = Url::parse(location) {
         return Ok(url.to_string());
     }
