@@ -19,7 +19,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 180
     env:
-      NPM_CONFIG_CACHE: ${{ runner.temp }}\npm-cache
+      NPM_CONFIG_CACHE: ${{ github.workspace }}/.npm-cache
 
     steps:
       - uses: actions/checkout@v4
