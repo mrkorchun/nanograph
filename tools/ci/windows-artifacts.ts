@@ -7,7 +7,7 @@ const {
   writeFileSync
 } = require("node:fs");
 const { dirname, isAbsolute, join } = require("node:path");
-const { spawnSync } = require("node:child_process");
+const { spawn } = require("node:child_process");
 const { createHash } = require("node:crypto");
 
 type Fields = Record<string, unknown>;
@@ -38,7 +38,7 @@ function commandName(name: string): string {
   return name;
 }
 
-function run(
+async function run(
   phase: string,
   expected: string,
   hypothesis: string,
@@ -46,7 +46,7 @@ function run(
   command: string,
   args: string[],
   env: NodeJS.ProcessEnv = {}
-): void {
+): Promise<void> {
   const started = Date.now();
   log("phase-start", {
     phase,
@@ -56,28 +56,43 @@ function run(
     command: [command, ...args].join(" ")
   });
 
-  const result = spawnSync(command, args, {
+  const child = spawn(command, args, {
     cwd,
     env: { ...process.env, ...env },
-    encoding: "utf8",
     shell: process.platform === "win32" && (command === "npm" || command === "npx"),
     stdio: ["ignore", "pipe", "pipe"]
   });
 
-  if (result.stdout) {
-    process.stdout.write(result.stdout);
-  }
-  if (result.stderr) {
-    process.stderr.write(result.stderr);
-  }
+  const stdout = new RingBuffer(40);
+  const stderr = new RingBuffer(40);
 
-  const fields = {
+  child.stdout?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk: string) => {
+    process.stdout.write(chunk);
+    stdout.pushChunk(chunk);
+  });
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk: string) => {
+    process.stderr.write(chunk);
+    stderr.pushChunk(chunk);
+  });
+
+  const result = await new Promise<{ status: number | null; signal: NodeJS.Signals | null; error?: Error }>((resolveResult) => {
+    child.on("error", (error: Error) => {
+      resolveResult({ status: null, signal: null, error });
+    });
+    child.on("close", (status: number | null, signal: NodeJS.Signals | null) => {
+      resolveResult({ status, signal });
+    });
+  });
+
+  const fields: Fields = {
     phase,
     elapsedMs: Date.now() - started,
     exitCode: result.status,
     signal: result.signal,
-    stdoutTail: tail(result.stdout),
-    stderrTail: tail(result.stderr)
+    stdoutTail: stdout.toString(),
+    stderrTail: stderr.toString()
   };
 
   if (result.status === 0) {
@@ -94,12 +109,33 @@ function run(
   process.exit(result.status ?? 1);
 }
 
-function tail(text: string | null | undefined): string {
-  if (!text) {
-    return "";
+class RingBuffer {
+  private readonly limit: number;
+  private readonly lines: string[] = [];
+  private pending = "";
+
+  constructor(limit: number) {
+    this.limit = limit;
   }
-  const lines = text.trimEnd().split(/\r?\n/);
-  return lines.slice(Math.max(0, lines.length - 40)).join("\n");
+
+  pushChunk(chunk: string): void {
+    const parts = (this.pending + chunk).split(/\r?\n/);
+    this.pending = parts.pop() ?? "";
+    for (const line of parts) {
+      this.lines.push(line);
+      while (this.lines.length > this.limit) {
+        this.lines.shift();
+      }
+    }
+  }
+
+  toString(): string {
+    const lines = [...this.lines];
+    if (this.pending !== "") {
+      lines.push(this.pending);
+    }
+    return lines.slice(Math.max(0, lines.length - this.limit)).join("\n");
+  }
 }
 
 function requireFile(phase: string, path: string): void {
@@ -136,7 +172,7 @@ const tsDir = join(root, "crates", "nanograph-ts");
 const cliExe = join(root, "target", "release", "nanograph.exe");
 const tsBinding = join(tsDir, "nanograph.win32-x64-msvc.node");
 
-function recordEnvironment(): void {
+async function recordEnvironment(): Promise<void> {
   log("environment", {
     root,
     tracePath,
@@ -146,23 +182,23 @@ function recordEnvironment(): void {
     githubSha: process.env.GITHUB_SHA,
     runnerOs: process.env.RUNNER_OS
   });
-  run("rust.version", "rust toolchain is installed", "toolchain install step did not run or PATH is broken", root, "rustc", ["--version"]);
-  run("cargo.version", "cargo is available", "toolchain install step did not run or PATH is broken", root, "cargo", ["+1.94.1", "--version"]);
-  run("node.version", "node is available", "actions/setup-node did not install the requested Node version", root, "node", ["--version"]);
+  await run("rust.version", "rust toolchain is installed", "toolchain install step did not run or PATH is broken", root, "rustc", ["--version"]);
+  await run("cargo.version", "cargo is available", "toolchain install step did not run or PATH is broken", root, "cargo", ["+1.94.1", "--version"]);
+  await run("node.version", "node is available", "actions/setup-node did not install the requested Node version", root, "node", ["--version"]);
 }
 
-function installNpm(): void {
-  run("npm.install", "npm dependencies install without running package scripts", "package-lock drift or npm cache corruption", tsDir, commandName("npm"), ["install", "--ignore-scripts"]);
+async function installNpm(): Promise<void> {
+  await run("npm.install", "npm dependencies install without running package scripts", "package-lock drift or npm cache corruption", tsDir, commandName("npm"), ["install", "--ignore-scripts"]);
 }
 
-function buildCliRelease(): void {
-  run("build.cli.release", "release CLI builds successfully", "Rust dependency, upstream merge, or Windows linker failure", root, "cargo", ["+1.94.1", "build", "-p", "nanograph-cli", "--release", "--locked"]);
+async function buildCliRelease(): Promise<void> {
+  await run("build.cli.release", "release CLI builds successfully", "Rust dependency, upstream merge, or Windows linker failure", root, "cargo", ["+1.94.1", "build", "-p", "nanograph-cli", "--release", "--locked"]);
 }
 
-function packageCliRelease(): void {
+async function packageCliRelease(): Promise<void> {
   const phase = "package.cli.release";
   requireFile(phase, cliExe);
-  run("verify.cli.release", "release CLI starts and prints a version", "binary exists but runtime initialization fails", root, cliExe, ["--version"]);
+  await run("verify.cli.release", "release CLI starts and prints a version", "binary exists but runtime initialization fails", root, cliExe, ["--version"]);
   const outputDir = join(artifactRoot, "nanograph-windows-x64-cli-release");
   const outputExe = join(outputDir, "nanograph.exe");
   copyArtifact(cliExe, outputExe);
@@ -176,7 +212,7 @@ function packageCliRelease(): void {
   });
 }
 
-function buildTs(profile: "debug" | "release"): void {
+async function buildTs(profile: "debug" | "release"): Promise<void> {
   const releaseArgs = profile === "release" ? ["--release"] : [];
   const traceEnv = profile === "debug"
     ? {
@@ -186,7 +222,7 @@ function buildTs(profile: "debug" | "release"): void {
         NAPI_RS_LOG: "debug"
       }
     : {};
-  run(
+  await run(
     `build.ts.${profile}`,
     `${profile} TS native binding builds successfully`,
     "napi build, Rust dependency, or Lance Windows build failure",
@@ -197,10 +233,10 @@ function buildTs(profile: "debug" | "release"): void {
   );
 }
 
-function packageTs(profile: "debug" | "release"): void {
+async function packageTs(profile: "debug" | "release"): Promise<void> {
   const phase = `package.ts.${profile}`;
   requireFile(phase, tsBinding);
-  run(
+  await run(
     `verify.ts.${profile}`,
     `${profile} TS binding exports Database`,
     "native module loads but napi exports are broken",
@@ -228,15 +264,15 @@ function packageTs(profile: "debug" | "release"): void {
   });
 }
 
-function all(): void {
-  recordEnvironment();
-  installNpm();
-  buildCliRelease();
-  packageCliRelease();
-  buildTs("debug");
-  packageTs("debug");
-  buildTs("release");
-  packageTs("release");
+async function all(): Promise<void> {
+  await recordEnvironment();
+  await installNpm();
+  await buildCliRelease();
+  await packageCliRelease();
+  await buildTs("debug");
+  await packageTs("debug");
+  await buildTs("release");
+  await packageTs("release");
   log("done", {
     expected: "release artifacts are usable and debug diagnostics are available",
     hypothesis: "if this point is reached, remaining Lance slowdown must be measured with the repro binary",
@@ -245,34 +281,47 @@ function all(): void {
 }
 
 const command = process.argv[2] ?? "all";
-switch (command) {
-  case "all":
-    all();
-    break;
-  case "record-env":
-    recordEnvironment();
-    break;
-  case "install-npm":
-    installNpm();
-    break;
-  case "build-cli-release":
-    buildCliRelease();
-    break;
-  case "package-cli-release":
-    packageCliRelease();
-    break;
-  case "build-ts-debug":
-    buildTs("debug");
-    break;
-  case "package-ts-debug":
-    packageTs("debug");
-    break;
-  case "build-ts-release":
-    buildTs("release");
-    break;
-  case "package-ts-release":
-    packageTs("release");
-    break;
-  default:
-    throw new Error(`unknown command: ${command}`);
+main(command).catch((error: Error) => {
+  log("phase-error", {
+    phase: "windows-artifacts",
+    expected: "CI helper completes requested command",
+    hypothesis: "unexpected helper exception",
+    error: error.message,
+    stack: error.stack
+  });
+  process.exit(1);
+});
+
+async function main(command: string): Promise<void> {
+  switch (command) {
+    case "all":
+      await all();
+      break;
+    case "record-env":
+      await recordEnvironment();
+      break;
+    case "install-npm":
+      await installNpm();
+      break;
+    case "build-cli-release":
+      await buildCliRelease();
+      break;
+    case "package-cli-release":
+      await packageCliRelease();
+      break;
+    case "build-ts-debug":
+      await buildTs("debug");
+      break;
+    case "package-ts-debug":
+      await packageTs("debug");
+      break;
+    case "build-ts-release":
+      await buildTs("release");
+      break;
+    case "package-ts-release":
+      await packageTs("release");
+      break;
+    default:
+      throw new Error(`unknown command: ${command}`);
+  }
 }
