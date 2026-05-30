@@ -1,4 +1,4 @@
-name: Windows TS Binding Artifact
+name: Windows Artifacts
 
 on:
   push:
@@ -11,11 +11,12 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  NODE_VERSION: "20"
+  NODE_VERSION: "24"
+  NANOGRAPH_CI_TRACE: target/ci-artifacts/windows-artifacts-trace.jsonl
 
 jobs:
-  windows-ts-binding:
-    name: Build Windows TS native binding
+  windows-artifacts:
+    name: Build release and debug artifacts
     runs-on: windows-2022
     timeout-minutes: 180
     env:
@@ -46,12 +47,18 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: windows-ts-binding-cargo-${{ hashFiles('Cargo.lock') }}
+          key: windows-artifacts-cargo-${{ runner.os }}-rust-1.94.1-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            windows-ts-sdk-cargo-${{ hashFiles('Cargo.lock') }}
+            windows-ts-binding-cargo-${{ hashFiles('Cargo.lock') }}
+            windows-cli-artifact-${{ hashFiles('Cargo.lock') }}
+            windows-native-cli-release-${{ hashFiles('Cargo.lock') }}
+            windows-native-cli-${{ hashFiles('Cargo.lock') }}
             npm-x86_64-pc-windows-msvc-${{ hashFiles('Cargo.lock') }}
+            windows-artifacts-cargo-${{ runner.os }}-rust-1.94.1-
             windows-ts-binding-cargo-
-            windows-ts-sdk-cargo-
+            windows-cli-artifact-
+            windows-native-cli-
+            windows-cli-
             npm-x86_64-pc-windows-msvc-
 
       - name: Restore npm cache
@@ -59,39 +66,43 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.NPM_CONFIG_CACHE }}
-          key: windows-ts-binding-npm-${{ hashFiles('crates/nanograph-ts/package.json', 'package-lock.json') }}
+          key: windows-artifacts-npm-${{ hashFiles('crates/nanograph-ts/package.json', 'package-lock.json') }}
           restore-keys: |
+            windows-ts-binding-npm-${{ hashFiles('crates/nanograph-ts/package.json', 'package-lock.json') }}
+            windows-artifacts-npm-
             windows-ts-binding-npm-
 
-      - name: Install npm deps
-        working-directory: crates/nanograph-ts
-        run: npm install --ignore-scripts
+      - name: Build artifacts
+        env:
+          CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+          NPM_CACHE_HIT: ${{ steps.npm-cache.outputs.cache-hit }}
+        run: node --experimental-strip-types tools/ci/windows-artifacts.ts all
 
-      - name: Build .node binary
-        working-directory: crates/nanograph-ts
-        run: npx napi build --platform --js index.js --release --target x86_64-pc-windows-msvc
-
-      - name: Verify native binding
-        working-directory: crates/nanograph-ts
-        shell: pwsh
-        run: |
-          $binding = Join-Path $PWD 'nanograph.win32-x64-msvc.node'
-          if (-not (Test-Path -LiteralPath $binding)) {
-            throw "missing Windows native binding: $binding"
-          }
-          node -e "const ng=require('.'); if (typeof ng.Database !== 'function') throw new Error('Database export missing'); console.log(typeof ng.Database)"
-          $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $binding
-          "$($hash.Hash.ToLowerInvariant())  nanograph.win32-x64-msvc.node" |
-            Set-Content -NoNewline -Path "$binding.sha256"
-
-      - name: Upload Windows TS native binding
+      - name: Upload release CLI
         uses: actions/upload-artifact@v4
         with:
-          name: nanograph-ts-win32-x64-msvc-node
-          path: |
-            crates/nanograph-ts/nanograph.win32-x64-msvc.node
-            crates/nanograph-ts/nanograph.win32-x64-msvc.node.sha256
+          name: nanograph-windows-x64-cli-release
+          path: target/ci-artifacts/nanograph-windows-x64-cli-release/
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload release TS native binding
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanograph-ts-win32-x64-msvc-node-release
+          path: target/ci-artifacts/nanograph-ts-win32-x64-msvc-node-release/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload debug diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanograph-windows-debug-diagnostics
+          path: |
+            target/ci-artifacts/nanograph-ts-win32-x64-msvc-node-debug/
+            target/ci-artifacts/windows-artifacts-trace.jsonl
+          if-no-files-found: warn
           retention-days: 14
 
       - name: Save cargo cache

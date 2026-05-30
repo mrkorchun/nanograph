@@ -601,3 +601,23 @@ pub(crate) fn tx_properties(
         ("op_summary".to_string(), op_summary.to_string()),
     ])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_drive_paths_are_file_uris_before_url_parsing() {
+        let db_dir = Path::new(r"D:\tmp\nanograph-db");
+        let location = r"D:\tmp\nanograph-db\nodes\item";
+
+        let dataset_uri = namespace_location_to_dataset_uri(db_dir, location).unwrap();
+        let absolute_uri = namespace_location_to_absolute_dataset_uri(location).unwrap();
+
+        assert!(dataset_uri.starts_with("file:///"));
+        assert!(absolute_uri.starts_with("file:///"));
+        assert!(!dataset_uri.starts_with("d:"));
+        assert!(!absolute_uri.starts_with("d:"));
+    }
+}
