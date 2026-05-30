@@ -11,6 +11,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   NODE_VERSION: "24"
   NANOGRAPH_CI_TRACE: target/ci-artifacts/windows-artifacts-trace.jsonl
 
@@ -58,7 +59,6 @@ jobs:
             windows-ts-binding-cargo-
             windows-cli-artifact-
             windows-native-cli-
-            windows-cli-
             npm-x86_64-pc-windows-msvc-
 
       - name: Restore npm cache
@@ -106,7 +106,7 @@ jobs:
           retention-days: 14
 
       - name: Save cargo cache
-        if: always() && steps.cargo-cache.outputs.cache-hit != 'true' && steps.cargo-cache.outputs.cache-primary-key != ''
+        if: success() && steps.cargo-cache.outputs.cache-hit != 'true' && steps.cargo-cache.outputs.cache-primary-key != ''
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
@@ -117,7 +117,7 @@ jobs:
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: Save npm cache
-        if: always() && steps.npm-cache.outputs.cache-hit != 'true' && steps.npm-cache.outputs.cache-primary-key != ''
+        if: success() && steps.npm-cache.outputs.cache-hit != 'true' && steps.npm-cache.outputs.cache-primary-key != ''
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
