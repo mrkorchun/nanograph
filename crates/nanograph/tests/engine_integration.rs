@@ -5,7 +5,7 @@ use arrow_array::{
     StringArray, UInt64Array,
 };
 use lance::Dataset;
-use lance_index::DatasetIndexExt;
+use lance::index::DatasetIndexExt;
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -253,6 +253,7 @@ async fn run_db_mutation_test_with_params(
         nanograph::RunResult::Mutation(result) => MutationExecResult {
             affected_nodes: result.affected_nodes,
             affected_edges: result.affected_edges,
+            matched_nodes: result.matched_nodes,
         },
         nanograph::RunResult::Query(_) => panic!("expected mutation result"),
     }
@@ -1656,6 +1657,824 @@ query q() {
                 && row.type_name == "Person"
         }),
         "expected node update CDC event in latest db version"
+    );
+}
+
+#[tokio::test]
+async fn test_put_node_inserts_when_absent_and_updates_when_present() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    // Start empty — no Alice yet.
+    let mut params = ParamMap::new();
+    params.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Alice".to_string()),
+    );
+    params.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(30),
+    );
+    let result = run_db_mutation_test_with_params(
+        r#"
+query upsert_person($name: String, $age: I32) {
+    put Person { name: $name, age: $age }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    assert_eq!(result.affected_nodes, 1);
+
+    let rows = export_rows_for_db(&db).await;
+    let alice = rows
+        .iter()
+        .find(|row| {
+            row.get("type").and_then(serde_json::Value::as_str) == Some("Person")
+                && row["data"]["name"].as_str() == Some("Alice")
+        })
+        .unwrap();
+    assert_eq!(alice["data"]["age"].as_i64(), Some(30));
+
+    // Same put with a different age — should update, not duplicate.
+    params.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(42),
+    );
+    let result2 = run_db_mutation_test_with_params(
+        r#"
+query upsert_person($name: String, $age: I32) {
+    put Person { name: $name, age: $age }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    assert_eq!(result2.affected_nodes, 1);
+
+    let rows_after = export_rows_for_db(&db).await;
+    let alices: Vec<_> = rows_after
+        .iter()
+        .filter(|row| {
+            row.get("type").and_then(serde_json::Value::as_str) == Some("Person")
+                && row["data"]["name"].as_str() == Some("Alice")
+        })
+        .collect();
+    assert_eq!(alices.len(), 1, "put must not duplicate by @key");
+    assert_eq!(alices[0]["data"]["age"].as_i64(), Some(42));
+}
+
+#[tokio::test]
+async fn test_query_embedding_cache_skips_network_on_repeat() {
+    // CL-510: an agent that issues the same `nearest($x, $q)` query
+    // repeatedly should only embed `$q` once. We verify by running the
+    // same query 5× and asserting the per-runtime cache holds exactly
+    // one entry after.
+    let _guard = EMBED_ENV_LOCK.lock().await;
+    let prev_mock = std::env::var_os("NANOGRAPH_EMBEDDINGS_MOCK");
+    unsafe {
+        std::env::set_var("NANOGRAPH_EMBEDDINGS_MOCK", "1");
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(
+        &db_path,
+        r#"
+node Doc {
+    slug: String @key
+    body: String
+    embedding: Vector(8) @embed(body) @index
+}
+"#,
+    )
+    .await
+    .unwrap();
+    db.load(
+        r#"{"type":"Doc","data":{"slug":"a","body":"alpha doc about graphs"}}
+{"type":"Doc","data":{"slug":"b","body":"beta doc about databases"}}
+{"type":"Doc","data":{"slug":"c","body":"gamma doc about queries"}}
+"#,
+    )
+    .await
+    .unwrap();
+
+    let query_src = r#"
+query similar($q: String) {
+    match { $d: Doc }
+    return { $d.slug, nearest($d.embedding, $q) as score }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+"#;
+    let mut params = ParamMap::new();
+    params.insert(
+        "q".to_string(),
+        nanograph::query::ast::Literal::String("graphs and queries".to_string()),
+    );
+
+    // Cache starts empty.
+    assert_eq!(db.query_embedding_cache_size_for_tests(), 0);
+
+    // 5 calls with the same query text.
+    for _ in 0..5 {
+        let batches = run_db_query_test_with_params(query_src, &db, &params).await;
+        let slugs = extract_string_column(&batches, "slug");
+        assert_eq!(slugs.len(), 3, "expected 3 ranked docs");
+    }
+
+    // Exactly one cache entry — the (model, "graphs and queries", 8) key.
+    // Note: nearest() appears in both filter and return positions in this
+    // query (via the AHashSet dedup); the cache further dedupes across
+    // all 5 executions.
+    assert_eq!(
+        db.query_embedding_cache_size_for_tests(),
+        1,
+        "5 calls with same $q should produce 1 cache entry"
+    );
+
+    // A different query text should produce a second entry.
+    let mut params2 = ParamMap::new();
+    params2.insert(
+        "q".to_string(),
+        nanograph::query::ast::Literal::String("different search text".to_string()),
+    );
+    let _ = run_db_query_test_with_params(query_src, &db, &params2).await;
+    assert_eq!(db.query_embedding_cache_size_for_tests(), 2);
+
+    // Restore env.
+    match prev_mock {
+        Some(value) => unsafe { std::env::set_var("NANOGRAPH_EMBEDDINGS_MOCK", value) },
+        None => unsafe { std::env::remove_var("NANOGRAPH_EMBEDDINGS_MOCK") },
+    }
+}
+
+#[tokio::test]
+async fn test_query_cache_returns_consistent_results_across_repeated_calls() {
+    // Regression for CL-508: the compiled-query cache must return identical
+    // results on hit vs miss. We call the same query 50× — first call is a
+    // miss (typecheck + lower), the next 49 are hits (cache-only path).
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    db.load(
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+"#,
+    )
+    .await
+    .unwrap();
+
+    let query_src = r#"
+query find_by_name($name: String) {
+    match { $p: Person { name: $name } }
+    return { $p.name as name }
+}
+"#;
+    let mut params = ParamMap::new();
+    params.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Alice".to_string()),
+    );
+
+    let mut results = Vec::new();
+    for _ in 0..50 {
+        let batches = run_db_query_test_with_params(query_src, &db, &params).await;
+        results.push(extract_string_column(&batches, "name"));
+    }
+    // Every call returns exactly one row "Alice".
+    for (i, names) in results.iter().enumerate() {
+        assert_eq!(names, &vec!["Alice".to_string()], "call {} mismatched", i);
+    }
+
+    // Mutation cache: also verify on a put.
+    let mut put_params = ParamMap::new();
+    put_params.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Eve".to_string()),
+    );
+    put_params.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(50),
+    );
+    let put_src = r#"
+query ensure_person($name: String, $age: I32) {
+    put Person { name: $name, age: $age }
+}
+"#;
+    for _ in 0..10 {
+        let r = run_db_mutation_test_with_params(put_src, &db, &put_params).await;
+        assert_eq!(r.affected_nodes, 1);
+        assert_eq!(r.matched_nodes, 1);
+    }
+
+    // Exactly one Eve after 10 cached put calls.
+    let rows = export_rows_for_db(&db).await;
+    let eves: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            row.get("type").and_then(serde_json::Value::as_str) == Some("Person")
+                && row["data"]["name"].as_str() == Some("Eve")
+        })
+        .collect();
+    assert_eq!(eves.len(), 1);
+}
+
+#[tokio::test]
+async fn test_fast_search_point_lookup_returns_correct_row() {
+    // Regression for CL-512: the fast_search gate fires when there's exactly
+    // one Eq predicate on an indexed property (@key qualifies). Verifies the
+    // gated path returns the right row and doesn't accidentally hide rows
+    // that should match.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    db.load(
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+{"type":"Person","data":{"name":"Carol","age":40}}
+"#,
+    )
+    .await
+    .unwrap();
+
+    // Point lookup on @key — fast_search gate should fire.
+    let mut params = ParamMap::new();
+    params.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Bob".to_string()),
+    );
+    let batches = run_db_query_test_with_params(
+        r#"
+query find_by_name($name: String) {
+    match { $p: Person { name: $name } }
+    return { $p.name as name, $p.age as age }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    let names = extract_string_column(&batches, "name");
+    assert_eq!(names, vec!["Bob".to_string()]);
+
+    // Lookup for non-existent row — gate fires, must return empty (not error).
+    let mut params_missing = ParamMap::new();
+    params_missing.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Nobody".to_string()),
+    );
+    let empty = run_db_query_test_with_params(
+        r#"
+query find_by_name($name: String) {
+    match { $p: Person { name: $name } }
+    return { $p.name as name }
+}
+"#,
+        &db,
+        &params_missing,
+    )
+    .await;
+    let empty_names = extract_string_column(&empty, "name");
+    assert!(empty_names.is_empty(), "expected no rows for missing key");
+}
+
+#[tokio::test]
+async fn test_put_back_to_back_same_key_does_not_ambiguous_merge() {
+    // Regression for CL-505: an upstream Lance 4.0.x bug where back-to-back
+    // MergeInsertBuilder operations on the same key in a multi-row table
+    // could panic with "Ambiguous merge inserts" because of double-processing
+    // in `processed_row_ids`. The fix is opting into SourceDedupeBehavior::FirstSeen
+    // on the builder. We test by hammering the same key 20× in tight sequence,
+    // then asserting exactly one row remains and the latest write wins.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    // Seed two other rows so the merge target table is multi-row when each
+    // put runs (the bug only triggers in multi-row contexts).
+    db.load(
+        r#"{"type":"Person","data":{"name":"OtherA","age":1}}
+{"type":"Person","data":{"name":"OtherB","age":2}}
+"#,
+    )
+    .await
+    .unwrap();
+
+    for i in 0..20i32 {
+        let mut params = ParamMap::new();
+        params.insert(
+            "name".to_string(),
+            nanograph::query::ast::Literal::String("Alice".to_string()),
+        );
+        params.insert(
+            "age".to_string(),
+            nanograph::query::ast::Literal::Integer(i.into()),
+        );
+        let result = run_db_mutation_test_with_params(
+            r#"
+query upsert($name: String, $age: I32) {
+    put Person { name: $name, age: $age }
+}
+"#,
+            &db,
+            &params,
+        )
+        .await;
+        assert_eq!(
+            result.affected_nodes, 1,
+            "iteration {} should report affected_nodes=1",
+            i
+        );
+    }
+
+    let rows = export_rows_for_db(&db).await;
+    let alices: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            row.get("type").and_then(serde_json::Value::as_str) == Some("Person")
+                && row["data"]["name"].as_str() == Some("Alice")
+        })
+        .collect();
+    assert_eq!(
+        alices.len(),
+        1,
+        "20× put on same key must collapse to exactly one row"
+    );
+    assert_eq!(
+        alices[0]["data"]["age"].as_i64(),
+        Some(19),
+        "last write wins"
+    );
+}
+
+#[tokio::test]
+async fn test_put_edge_is_idempotent() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    db.load(
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+"#,
+    )
+    .await
+    .unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "from".to_string(),
+        nanograph::query::ast::Literal::String("Alice".to_string()),
+    );
+    params.insert(
+        "to".to_string(),
+        nanograph::query::ast::Literal::String("Bob".to_string()),
+    );
+
+    let put = r#"
+query ensure_knows($from: String, $to: String) {
+    put Knows { from: $from, to: $to }
+}
+"#;
+
+    let r1 = run_db_mutation_test_with_params(put, &db, &params).await;
+    assert_eq!(r1.affected_edges, 1);
+    let r2 = run_db_mutation_test_with_params(put, &db, &params).await;
+    assert_eq!(
+        r2.affected_edges, 1,
+        "put reports the row touched each call"
+    );
+
+    // No duplicate edges after two calls.
+    let rows = export_rows_for_db(&db).await;
+    let knows: Vec<_> = rows
+        .iter()
+        .filter(|row| row.get("edge").and_then(serde_json::Value::as_str) == Some("Knows"))
+        .collect();
+    assert_eq!(knows.len(), 1, "put must not duplicate by (from, to)");
+}
+
+#[tokio::test]
+async fn test_put_node_without_key_property_errors_at_lint() {
+    use nanograph::build_catalog;
+    use nanograph::query::parser::parse_query;
+    use nanograph::query::typecheck::typecheck_query_decl;
+    let schema = r#"
+node Tag {
+    name: String
+}
+"#;
+    let parsed_schema = nanograph::schema::parser::parse_schema(schema).expect("parse schema");
+    let catalog = build_catalog(&parsed_schema).expect("build catalog");
+    let qf = parse_query(
+        r#"
+query tag_it($name: String) {
+    put Tag { name: $name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("T22") && msg.contains("@key"),
+        "expected T22 @key error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_update_with_conjunctive_where_block() {
+    // Verify the new `where { atom+ }` block AND's atoms conjunctively:
+    // only rows matching every atom should be touched.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    db.load(keyed_mutation_data()).await.unwrap();
+
+    // Alice is age 30; Bob is age 25. Update only the row whose name
+    // is "Alice" AND age is 30 — should affect exactly 1 row.
+    let mut params = ParamMap::new();
+    params.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Alice".to_string()),
+    );
+    params.insert(
+        "expected".to_string(),
+        nanograph::query::ast::Literal::Integer(30),
+    );
+    params.insert(
+        "next".to_string(),
+        nanograph::query::ast::Literal::Integer(31),
+    );
+    let result = run_db_mutation_test_with_params(
+        r#"
+query bump_age($name: String, $expected: I32, $next: I32) {
+    update Person set { age: $next } where {
+        name = $name
+        age = $expected
+    }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    assert_eq!(result.affected_nodes, 1);
+
+    // Calling the same mutation again should be a no-op now that age = 31,
+    // not 30 — the conjunctive predicate fails on the age atom.
+    let result2 = run_db_mutation_test_with_params(
+        r#"
+query bump_age($name: String, $expected: I32, $next: I32) {
+    update Person set { age: $next } where {
+        name = $name
+        age = $expected
+    }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    assert_eq!(result2.affected_nodes, 0);
+}
+
+#[tokio::test]
+async fn test_update_with_is_null_atom_in_where_block() {
+    // Race-safe claim pattern: only update rows where the gate field is null.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    // Seed with one row whose age is null and one whose age is set.
+    db.load(
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob"}}
+"#,
+    )
+    .await
+    .unwrap();
+
+    // Update Bob (age is null) — should affect 1 row.
+    let mut params = ParamMap::new();
+    params.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Bob".to_string()),
+    );
+    params.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(42),
+    );
+    let result = run_db_mutation_test_with_params(
+        r#"
+query first_claim($name: String, $age: I32) {
+    update Person set { age: $age } where {
+        name = $name
+        age is null
+    }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(result.matched_nodes, 1, "CAS won → matched_nodes is 1");
+
+    // Same call again — Bob's age is no longer null, so the gate fails.
+    let result2 = run_db_mutation_test_with_params(
+        r#"
+query first_claim($name: String, $age: I32) {
+    update Person set { age: $age } where {
+        name = $name
+        age is null
+    }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    assert_eq!(result2.affected_nodes, 0);
+    assert_eq!(
+        result2.matched_nodes, 0,
+        "CAS lost → matched_nodes is 0 (the canonical agent signal)"
+    );
+
+    // Alice's age was 30 (not null) from the start — the gate excludes her.
+    let mut params_alice = ParamMap::new();
+    params_alice.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Alice".to_string()),
+    );
+    params_alice.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(99),
+    );
+    let result3 = run_db_mutation_test_with_params(
+        r#"
+query first_claim($name: String, $age: I32) {
+    update Person set { age: $age } where {
+        name = $name
+        age is null
+    }
+}
+"#,
+        &db,
+        &params_alice,
+    )
+    .await;
+    assert_eq!(result3.affected_nodes, 0);
+}
+
+#[tokio::test]
+async fn test_concurrent_cas_claim_exactly_one_wins() {
+    // The headline correctness claim: two simultaneous claims on the same row.
+    // The IS NULL gate combined with Lance's commit-level optimistic
+    // concurrency must guarantee exactly one matches — the other sees the
+    // gate fail at executor evaluation time (because the first claim's
+    // commit already flipped the column to non-null).
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    db.load(r#"{"type":"Person","data":{"name":"Bob"}}"#)
+        .await
+        .unwrap();
+
+    let claim = r#"
+query claim($name: String, $age: I32) {
+    update Person set { age: $age } where {
+        name = $name
+        age is null
+    }
+}
+"#;
+
+    let mut params_a = ParamMap::new();
+    params_a.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Bob".to_string()),
+    );
+    params_a.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(11),
+    );
+    let mut params_b = ParamMap::new();
+    params_b.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Bob".to_string()),
+    );
+    params_b.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(22),
+    );
+
+    let (r_a, r_b) = tokio::join!(
+        run_db_mutation_test_with_params(claim, &db, &params_a),
+        run_db_mutation_test_with_params(claim, &db, &params_b),
+    );
+
+    // Exactly one matched. The other's IS NULL gate failed because the first
+    // call's commit flipped the column to non-null before the second
+    // executor's mask construction read it.
+    let total_matched = r_a.matched_nodes + r_b.matched_nodes;
+    assert_eq!(
+        total_matched, 1,
+        "expected exactly one CAS winner, got a={} b={}",
+        r_a.matched_nodes, r_b.matched_nodes
+    );
+
+    // And the final row reflects exactly one winner — either 11 or 22, not both.
+    let rows = export_rows_for_db(&db).await;
+    let bob = rows
+        .iter()
+        .find(|row| {
+            row.get("type").and_then(serde_json::Value::as_str) == Some("Person")
+                && row["data"]["name"].as_str() == Some("Bob")
+        })
+        .unwrap();
+    let age = bob["data"]["age"].as_i64().unwrap();
+    assert!(age == 11 || age == 22, "unexpected final age {}", age);
+}
+
+#[tokio::test]
+async fn test_delete_with_conjunctive_where_block() {
+    // Conjunctive predicates work in delete too — only rows matching every
+    // atom should be removed.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    db.load(
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":30}}
+{"type":"Person","data":{"name":"Carol","age":40}}
+"#,
+    )
+    .await
+    .unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Alice".to_string()),
+    );
+    params.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(30),
+    );
+    let result = run_db_mutation_test_with_params(
+        r#"
+query del($name: String, $age: I32) {
+    delete Person where {
+        name = $name
+        age = $age
+    }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(result.matched_nodes, 1);
+
+    // Bob (matches age but not name) and Carol (matches neither) survive.
+    let rows = export_rows_for_db(&db).await;
+    let persons: Vec<_> = rows
+        .iter()
+        .filter(|row| row.get("type").and_then(serde_json::Value::as_str) == Some("Person"))
+        .collect();
+    assert_eq!(persons.len(), 2);
+    assert!(
+        persons.iter().any(|p| p["data"]["name"] == "Bob"),
+        "Bob should survive"
+    );
+    assert!(
+        persons.iter().any(|p| p["data"]["name"] == "Carol"),
+        "Carol should survive"
+    );
+}
+
+#[tokio::test]
+async fn test_is_not_null_atom_in_where_block() {
+    // Symmetric with is_null — only rows where the property IS set should match.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    db.load(
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob"}}
+"#,
+    )
+    .await
+    .unwrap();
+
+    let result = run_db_mutation_test_with_params(
+        r#"
+query clear_ages() {
+    delete Person where { age is not null }
+}
+"#,
+        &db,
+        &ParamMap::new(),
+    )
+    .await;
+    // Alice (age set) deleted; Bob (age null) survives.
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(result.matched_nodes, 1);
+
+    let rows = export_rows_for_db(&db).await;
+    let persons: Vec<_> = rows
+        .iter()
+        .filter(|row| row.get("type").and_then(serde_json::Value::as_str) == Some("Person"))
+        .collect();
+    assert_eq!(persons.len(), 1);
+    assert_eq!(persons[0]["data"]["name"], "Bob");
+}
+
+#[tokio::test]
+async fn test_typecheck_is_null_on_non_nullable_property_fails() {
+    let catalog = build_catalog(
+        &parse_schema(
+            r#"
+node Person {
+    name: String @key
+    age: I32
+}
+"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let qf = parse_query(
+        r#"
+query del() {
+    delete Person where {
+        name = "x"
+        age is null
+    }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("T11") && msg.contains("non-nullable") && msg.contains("age"),
+        "expected non-nullable IS NULL error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_typecheck_multi_atom_with_unknown_property_fails() {
+    let catalog = build_catalog(
+        &parse_schema(
+            r#"
+node Person {
+    name: String @key
+    age: I32?
+}
+"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let qf = parse_query(
+        r#"
+query bad() {
+    update Person set { age: 1 } where {
+        name = "x"
+        nonexistent = 42
+    }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("T11") && msg.contains("nonexistent"),
+        "expected unknown property error, got: {msg}"
     );
 }
 

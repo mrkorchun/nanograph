@@ -69,9 +69,45 @@ pub enum LoadMode {
 
 #[derive(Debug, Clone)]
 pub struct DeletePredicate {
-    pub property: String,
-    pub op: DeleteOp,
-    pub value: String,
+    pub atoms: Vec<DeletePredAtom>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DeletePredAtom {
+    Compare {
+        property: String,
+        op: DeleteOp,
+        value: String,
+    },
+    IsNull {
+        property: String,
+    },
+    IsNotNull {
+        property: String,
+    },
+}
+
+impl DeletePredicate {
+    /// Single-Compare predicate (the common case).
+    pub fn compare(property: String, op: DeleteOp, value: String) -> Self {
+        Self {
+            atoms: vec![DeletePredAtom::Compare {
+                property,
+                op,
+                value,
+            }],
+        }
+    }
+}
+
+impl DeletePredAtom {
+    pub fn property(&self) -> &str {
+        match self {
+            Self::Compare { property, .. }
+            | Self::IsNull { property }
+            | Self::IsNotNull { property } => property,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -295,6 +331,10 @@ pub struct DatabaseShared {
     pub catalog: Catalog,
     runtime: RwLock<Arc<DatabaseRuntime>>,
     writer: Mutex<()>,
+    /// CL-508: in-process cache of typechecked + lowered queries.
+    /// Scoped to this Database instance; never invalidated within its lifetime.
+    /// Schema migrations require Database re-open, which yields a fresh cache.
+    query_cache: crate::plan::cache::CompiledQueryCache,
 }
 
 #[derive(Clone)]
@@ -497,6 +537,7 @@ impl Database {
                 catalog,
                 runtime: RwLock::new(runtime),
                 writer: Mutex::new(()),
+                query_cache: crate::plan::cache::CompiledQueryCache::new(),
             }),
         }
     }
@@ -516,6 +557,12 @@ impl Database {
 
     pub fn is_in_memory(&self) -> bool {
         self.tempdir.is_some()
+    }
+
+    /// Test-only accessor for the query-embedding cache size (CL-510).
+    #[doc(hidden)]
+    pub fn query_embedding_cache_size_for_tests(&self) -> usize {
+        self.current_runtime().query_embedding_cache().__test_len()
     }
 
     pub(crate) async fn lock_writer(&self) -> DatabaseWriteGuard<'_> {
@@ -555,20 +602,61 @@ impl Database {
     }
 
     pub async fn run_query(&self, query: &QueryDecl, params: &ParamMap) -> Result<RunResult> {
-        if query.mutation.is_some() {
-            let checked = typecheck_query_decl(self.catalog(), query)?;
-            if !matches!(checked, CheckedQuery::Mutation(_)) {
-                return Err(NanoError::Type("expected mutation query".to_string()));
-            }
+        use crate::plan::cache::CachedCompilation;
+        let fingerprint = crate::plan::cache::CompiledQueryCache::fingerprint(query);
 
-            let mutation_ir = lower_mutation_query(query)?;
+        if query.mutation.is_some() {
+            // Try cache first; on miss, typecheck + lower and store.
+            let mutation_ir = match self.query_cache.get(fingerprint) {
+                Some(CachedCompilation::Mutation { ir }) => ir,
+                Some(CachedCompilation::Read { .. }) => {
+                    return Err(NanoError::Type(
+                        "expected mutation query (cached read found)".to_string(),
+                    ));
+                }
+                None => {
+                    let checked = typecheck_query_decl(self.catalog(), query)?;
+                    if !matches!(checked, CheckedQuery::Mutation(_)) {
+                        return Err(NanoError::Type("expected mutation query".to_string()));
+                    }
+                    let ir = lower_mutation_query(query)?;
+                    self.query_cache
+                        .insert(fingerprint, CachedCompilation::Mutation { ir: ir.clone() });
+                    ir
+                }
+            };
+
             let mut writer = self.lock_writer().await;
             let runtime_params = params_with_runtime_now(params)?;
             let result = execute_mutation(&mutation_ir, self, &runtime_params, &mut writer).await?;
             return Ok(RunResult::Mutation(MutationResult::from(result)));
         }
 
-        let prepared = self.prepare_read_query_with_storage(query, self.current_runtime())?;
+        // Read path: cache the lowered IR + inferred output schema.
+        let prepared = match self.query_cache.get(fingerprint) {
+            Some(CachedCompilation::Read { output_schema, ir }) => {
+                PreparedReadQuery::new(ir, output_schema, self.current_runtime())
+            }
+            Some(CachedCompilation::Mutation { .. }) => {
+                return Err(NanoError::Type(
+                    "expected read query (cached mutation found)".to_string(),
+                ));
+            }
+            None => {
+                let catalog = self.catalog().clone();
+                let type_ctx = typecheck_query(&catalog, query)?;
+                let output_schema = infer_query_result_schema(&catalog, query, &type_ctx)?;
+                let ir = lower_query(&catalog, query, &type_ctx)?;
+                self.query_cache.insert(
+                    fingerprint,
+                    CachedCompilation::Read {
+                        output_schema: output_schema.clone(),
+                        ir: ir.clone(),
+                    },
+                );
+                PreparedReadQuery::new(ir, output_schema, self.current_runtime())
+            }
+        };
         let result = prepared.execute(params).await?;
         Ok(RunResult::Query(result))
     }
