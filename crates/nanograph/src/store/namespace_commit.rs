@@ -538,17 +538,33 @@ async fn build_snapshot_bundle_with_staged_entries_async(
         );
     }
 
-    let mut published_versions = Vec::new();
     let published_lookup_start = Instant::now();
-    for entry in &snapshot.datasets {
-        let table_id = entry.effective_table_id();
-        if let Some(staged) = staged_entries_by_id.get(table_id) {
-            published_versions.push(staged.published_version.clone());
-            continue;
-        }
-        if let Some(version) =
-            namespace_published_version_for_table(db_dir, table_id, entry.dataset_version).await?
-        {
+    let lookup_plan = snapshot
+        .datasets
+        .iter()
+        .map(|entry| {
+            let table_id = entry.effective_table_id().to_string();
+            let dataset_version = entry.dataset_version;
+            let staged_version = staged_entries_by_id
+                .get(&table_id)
+                .map(|staged| staged.published_version.clone());
+            (table_id, dataset_version, staged_version)
+        })
+        .collect::<Vec<_>>();
+    let lookup_results = futures::stream::iter(lookup_plan.into_iter().map(
+        |(table_id, dataset_version, staged_version)| async move {
+            if let Some(version) = staged_version {
+                return Ok(Some(version));
+            }
+            namespace_published_version_for_table(db_dir, &table_id, dataset_version).await
+        },
+    ))
+    .buffer_unordered(16)
+    .collect::<Vec<Result<Option<NamespacePublishedVersion>>>>()
+    .await;
+    let mut published_versions = Vec::new();
+    for result in lookup_results {
+        if let Some(version) = result? {
             published_versions.push(version);
         }
     }

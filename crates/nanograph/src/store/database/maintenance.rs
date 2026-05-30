@@ -792,13 +792,26 @@ impl Database {
             }
         }
 
+        let mut node_id_cache: HashMap<String, HashSet<u64>> = HashMap::new();
         for edge_def in self.schema_ir.edge_types() {
-            let src_nodes = collect_existing_ids(
-                read_sparse_node_batch(&metadata, &edge_def.src_type_name).await?,
-            )?;
-            let dst_nodes = collect_existing_ids(
-                read_sparse_node_batch(&metadata, &edge_def.dst_type_name).await?,
-            )?;
+            if !node_id_cache.contains_key(&edge_def.src_type_name) {
+                let ids = collect_existing_ids(
+                    read_sparse_node_batch(&metadata, &edge_def.src_type_name).await?,
+                )?;
+                node_id_cache.insert(edge_def.src_type_name.clone(), ids);
+            }
+            if !node_id_cache.contains_key(&edge_def.dst_type_name) {
+                let ids = collect_existing_ids(
+                    read_sparse_node_batch(&metadata, &edge_def.dst_type_name).await?,
+                )?;
+                node_id_cache.insert(edge_def.dst_type_name.clone(), ids);
+            }
+            let src_nodes = node_id_cache
+                .get(&edge_def.src_type_name)
+                .expect("source node ids cached");
+            let dst_nodes = node_id_cache
+                .get(&edge_def.dst_type_name)
+                .expect("destination node ids cached");
             if let Some(edge_batch) = read_sparse_edge_batch(&metadata, &edge_def.name).await? {
                 let src_arr = edge_batch
                     .column_by_name("src")

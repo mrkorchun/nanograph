@@ -12,15 +12,17 @@ use lance::dataset::{
     InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams,
 };
 use lance_file::version::LanceFileVersion;
+use lance_namespace::LanceNamespace;
+use tokio::sync::OnceCell;
 use tracing::info;
 
 use crate::error::{NanoError, Result};
 use crate::store::graph_types::{GraphTableId, GraphTableVersion};
 use crate::store::metadata::DatasetLocator;
 use crate::store::namespace::{
-    local_path_to_file_uri, namespace_latest_version, namespace_location_to_dataset_uri,
-    namespace_location_to_local_path, open_directory_namespace, resolve_or_declare_table_location,
-    resolve_table_location,
+    declare_or_resolve_table_location, local_path_to_file_uri, namespace_latest_version,
+    namespace_location_to_dataset_uri, namespace_location_to_local_path, open_directory_namespace,
+    resolve_or_declare_table_location, resolve_table_location,
 };
 use crate::store::write_trace;
 
@@ -50,6 +52,9 @@ pub(crate) fn graph_table_id_for_path(path: &Path) -> GraphTableId {
 #[async_trait]
 pub(crate) trait TableStore: Send + Sync {
     async fn overwrite(&self, path: &Path, batch: RecordBatch) -> Result<GraphTableVersion>;
+    async fn overwrite_new(&self, path: &Path, batch: RecordBatch) -> Result<GraphTableVersion> {
+        self.overwrite(path, batch).await
+    }
     async fn append(&self, path: &Path, batch: RecordBatch) -> Result<GraphTableVersion>;
     async fn merge_insert_with_key(
         &self,
@@ -77,16 +82,25 @@ impl V3TableStore {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct V4NamespaceTableStore {
     db_path: PathBuf,
+    namespace: OnceCell<Arc<dyn LanceNamespace>>,
 }
 
 impl V4NamespaceTableStore {
     pub(crate) fn new(db_path: &Path) -> Self {
         Self {
             db_path: db_path.to_path_buf(),
+            namespace: OnceCell::new(),
         }
+    }
+
+    async fn namespace(&self) -> Result<Arc<dyn LanceNamespace>> {
+        self.namespace
+            .get_or_try_init(|| async { open_directory_namespace(&self.db_path).await })
+            .await
+            .cloned()
     }
 
     fn table_id_for_path(&self, path: &Path) -> Result<String> {
@@ -1019,7 +1033,7 @@ impl TableStore for V3TableStore {
 #[async_trait]
 impl TableStore for V4NamespaceTableStore {
     async fn overwrite(&self, path: &Path, batch: RecordBatch) -> Result<GraphTableVersion> {
-        let namespace = open_directory_namespace(&self.db_path).await?;
+        let namespace = self.namespace().await?;
         let table_id = self.table_id_for_path(path)?;
         let location = resolve_or_declare_table_location(namespace, &table_id).await?;
         let location_path = namespace_location_to_local_path(&self.db_path, &location)?;
@@ -1032,8 +1046,22 @@ impl TableStore for V4NamespaceTableStore {
         .await
     }
 
+    async fn overwrite_new(&self, path: &Path, batch: RecordBatch) -> Result<GraphTableVersion> {
+        let namespace = self.namespace().await?;
+        let table_id = self.table_id_for_path(path)?;
+        let location = declare_or_resolve_table_location(namespace, &table_id).await?;
+        let location_path = namespace_location_to_local_path(&self.db_path, &location)?;
+        write_lance_batch_with_mode_for_kind_versioned(
+            &location_path,
+            batch,
+            WriteMode::Overwrite,
+            lance_dataset_kind_for_table_id(&table_id),
+        )
+        .await
+    }
+
     async fn append(&self, path: &Path, batch: RecordBatch) -> Result<GraphTableVersion> {
-        let namespace = open_directory_namespace(&self.db_path).await?;
+        let namespace = self.namespace().await?;
         let table_id = self.table_id_for_path(path)?;
         let published = namespace_latest_version(namespace.clone(), &table_id).await?;
         let location = resolve_or_declare_table_location(namespace, &table_id).await?;
@@ -1057,7 +1085,7 @@ impl TableStore for V4NamespaceTableStore {
         key_prop: &str,
     ) -> Result<GraphTableVersion> {
         let table_id = self.table_id_for_path(path)?;
-        let namespace = open_directory_namespace(&self.db_path).await?;
+        let namespace = self.namespace().await?;
         let location = resolve_or_declare_table_location(namespace, &table_id).await?;
         cleanup_unpublished_manifest_versions(
             &self.db_path,
@@ -1083,7 +1111,7 @@ impl TableStore for V4NamespaceTableStore {
         ids: &[u64],
     ) -> Result<GraphTableVersion> {
         let table_id = self.table_id_for_path(path)?;
-        let namespace = open_directory_namespace(&self.db_path).await?;
+        let namespace = self.namespace().await?;
         let location = resolve_or_declare_table_location(namespace, &table_id).await?;
         cleanup_unpublished_manifest_versions(
             &self.db_path,
@@ -1096,7 +1124,7 @@ impl TableStore for V4NamespaceTableStore {
     }
 
     async fn latest_version(&self, path: &Path) -> Result<GraphTableVersion> {
-        let namespace = open_directory_namespace(&self.db_path).await?;
+        let namespace = self.namespace().await?;
         let table_id = self.table_id_for_path(path)?;
         namespace_latest_version(namespace, &table_id).await
     }

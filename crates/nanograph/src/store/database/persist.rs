@@ -1389,7 +1389,7 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             "overwrite"
         };
         let write_start = Instant::now();
-        let _staged_dataset_version = if can_merge_upsert {
+        let staged_dataset_version = if can_merge_upsert {
             let source_batch = node_delta.upserts.clone().ok_or_else(|| {
                 NanoError::Storage(format!("missing node upsert batch for {}", node_def.name))
             })?;
@@ -1461,7 +1461,14 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
                 rows = row_count,
                 "writing full node dataset from dataset mutation plan"
             );
-            table_store.overwrite(&dataset_path, batch).await?.version
+            if previous_entry.is_some() {
+                table_store.overwrite(&dataset_path, batch).await?.version
+            } else {
+                table_store
+                    .overwrite_new(&dataset_path, batch)
+                    .await?
+                    .version
+            }
         };
         write_trace::event(
             "persist_dataset_write_end",
@@ -1488,7 +1495,11 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
         rebuild_node_scalar_indexes(&dataset_physical_path, node_def).await?;
         rebuild_node_text_indexes(&dataset_physical_path, node_def).await?;
         rebuild_node_vector_indexes(&dataset_physical_path, node_def).await?;
-        let dataset_version = latest_lance_dataset_version(&dataset_physical_path).await?;
+        let dataset_version = if node_def_has_rebuilt_indexes(node_def) {
+            latest_lance_dataset_version(&dataset_physical_path).await?
+        } else {
+            staged_dataset_version
+        };
         write_trace::event(
             "persist_dataset_post_write_end",
             serde_json::json!({
@@ -1606,7 +1617,14 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
                 rows = row_count,
                 "writing full edge dataset from dataset mutation plan"
             );
-            table_store.overwrite(&dataset_path, batch).await?.version
+            if previous_entry.is_some() {
+                table_store.overwrite(&dataset_path, batch).await?.version
+            } else {
+                table_store
+                    .overwrite_new(&dataset_path, batch)
+                    .await?
+                    .version
+            }
         };
         write_trace::event(
             "persist_dataset_write_end",
@@ -1927,6 +1945,13 @@ fn sparse_load_restore_scope(
     }
 
     Ok((node_types, edge_types))
+}
+
+fn node_def_has_rebuilt_indexes(node_def: &crate::catalog::schema_ir::NodeTypeDef) -> bool {
+    node_def
+        .properties
+        .iter()
+        .any(|prop| prop.index && !prop.list)
 }
 
 async fn restore_sparse_existing_storage(

@@ -210,6 +210,27 @@ pub(crate) async fn resolve_or_declare_table_location(
     }
 }
 
+pub(crate) async fn declare_or_resolve_table_location(
+    namespace: Arc<dyn LanceNamespace>,
+    table_id: &str,
+) -> Result<String> {
+    match namespace
+        .declare_table(DeclareTableRequest {
+            id: Some(table_id_parts(table_id)),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(response) => response.location.ok_or_else(|| {
+            NanoError::Storage(format!(
+                "declared namespace table {} returned no location",
+                table_id
+            ))
+        }),
+        Err(_) => resolve_table_location(namespace, table_id).await,
+    }
+}
+
 pub(crate) async fn write_namespace_batch(
     namespace: Arc<dyn LanceNamespace>,
     table_id: &str,
