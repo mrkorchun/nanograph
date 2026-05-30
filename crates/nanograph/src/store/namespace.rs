@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use lance::Dataset;
 use lance::dataset::write::merge_insert::SourceDedupeBehavior;
@@ -23,6 +24,7 @@ use crate::store::lance_io::{
     write_lance_batch_with_mode_for_kind_versioned_and_properties,
 };
 use crate::store::manifest::{DatasetEntry, GraphManifest};
+use crate::store::write_trace;
 
 pub(crate) const GRAPH_TX_TABLE_ID: &str = "__graph_tx";
 pub(crate) const GRAPH_CHANGES_TABLE_ID: &str = "__graph_changes";
@@ -215,6 +217,7 @@ pub(crate) async fn write_namespace_batch(
     mode: WriteMode,
     transaction_properties: Option<HashMap<String, String>>,
 ) -> Result<GraphTableVersion> {
+    let trace_start = Instant::now();
     let kind = if table_id.starts_with("nodes/") {
         super::lance_io::LanceDatasetKind::Node
     } else if table_id.starts_with("edges/") {
@@ -225,16 +228,37 @@ pub(crate) async fn write_namespace_batch(
     let table_exists = resolve_table_location(namespace.clone(), table_id)
         .await
         .is_ok();
+    write_trace::event(
+        "namespace_write_resolve_exists_end",
+        serde_json::json!({
+            "tableId": table_id,
+            "exists": table_exists,
+            "mode": format!("{:?}", mode),
+            "rows": batch.num_rows(),
+            "elapsedMs": write_trace::elapsed_ms(trace_start),
+        }),
+    );
     let effective_mode = if table_exists {
         mode
     } else {
         WriteMode::Create
     };
+    let location_start = Instant::now();
     let location = resolve_or_declare_table_location(namespace.clone(), table_id).await?;
     let location_path = namespace_location_to_absolute_local_path(&location)?;
+    write_trace::event(
+        "namespace_write_location_end",
+        serde_json::json!({
+            "tableId": table_id,
+            "location": location,
+            "effectiveMode": format!("{:?}", effective_mode),
+            "elapsedMs": write_trace::elapsed_ms(location_start),
+        }),
+    );
+    let write_start = Instant::now();
     match effective_mode {
         WriteMode::Create | WriteMode::Overwrite => {
-            write_lance_batch_with_mode_for_kind_versioned_and_properties(
+            let result = write_lance_batch_with_mode_for_kind_versioned_and_properties(
                 &location_path,
                 batch,
                 effective_mode,
@@ -254,11 +278,22 @@ pub(crate) async fn write_namespace_batch(
                     table_id,
                     err
                 ))
-            })
+            });
+            write_trace::event(
+                "namespace_write_end",
+                serde_json::json!({
+                    "tableId": table_id,
+                    "effectiveMode": format!("{:?}", effective_mode),
+                    "ok": result.is_ok(),
+                    "elapsedMs": write_trace::elapsed_ms(write_start),
+                    "totalElapsedMs": write_trace::elapsed_ms(trace_start),
+                }),
+            );
+            result
         }
         WriteMode::Append => {
             let pinned_version = namespace_latest_version(namespace, table_id).await?;
-            append_lance_batch_at_version_for_kind_with_properties(
+            let result = append_lance_batch_at_version_for_kind_with_properties(
                 &location_path,
                 &pinned_version,
                 batch,
@@ -269,7 +304,18 @@ pub(crate) async fn write_namespace_batch(
             .map(|version| GraphTableVersion::new(table_id, version.version))
             .map_err(|err| {
                 NanoError::Lance(format!("namespace append {} error: {}", table_id, err))
-            })
+            });
+            write_trace::event(
+                "namespace_write_end",
+                serde_json::json!({
+                    "tableId": table_id,
+                    "effectiveMode": format!("{:?}", effective_mode),
+                    "ok": result.is_ok(),
+                    "elapsedMs": write_trace::elapsed_ms(write_start),
+                    "totalElapsedMs": write_trace::elapsed_ms(trace_start),
+                }),
+            );
+            result
         }
     }
 }

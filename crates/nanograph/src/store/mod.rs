@@ -19,6 +19,7 @@ pub mod storage_migrate;
 pub mod txlog;
 pub(crate) mod v4_graph_log;
 pub(crate) mod v4_internal;
+pub(crate) mod write_trace;
 
 pub use indexing::{scalar_index_name, text_index_name, vector_index_name};
 

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use async_trait::async_trait;
@@ -21,6 +22,7 @@ use crate::store::namespace::{
     namespace_location_to_local_path, open_directory_namespace, resolve_or_declare_table_location,
     resolve_table_location,
 };
+use crate::store::write_trace;
 
 pub(crate) const LANCE_INTERNAL_ID_FIELD: &str = "__ng_id";
 pub(crate) const LANCE_INTERNAL_SRC_FIELD: &str = "__ng_src";
@@ -332,13 +334,26 @@ async fn write_lance_batch_with_mode_and_storage_version_for_kind_versioned(
     kind: LanceDatasetKind,
     transaction_properties: Option<HashMap<String, String>>,
 ) -> Result<GraphTableVersion> {
+    let trace_start = Instant::now();
+    let original_rows = batch.num_rows();
     info!(
         dataset_path = %path.display(),
-        rows = batch.num_rows(),
+        rows = original_rows,
         mode = ?mode,
         "writing Lance dataset"
     );
+    let convert_start = Instant::now();
     let batch = logical_batch_to_lance(&batch, kind)?;
+    write_trace::event(
+        "lance_write_convert_end",
+        serde_json::json!({
+            "path": path.display().to_string(),
+            "kind": format!("{:?}", kind),
+            "mode": format!("{:?}", mode),
+            "rows": original_rows,
+            "elapsedMs": write_trace::elapsed_ms(convert_start),
+        }),
+    );
     let schema = batch.schema();
     let uri = local_path_to_file_uri(path)?;
 
@@ -366,9 +381,22 @@ async fn write_lance_batch_with_mode_and_storage_version_for_kind_versioned(
         }
     };
 
+    let write_start = Instant::now();
     let dataset = Dataset::write(reader, &uri, Some(write_params))
         .await
         .map_err(|e| NanoError::Lance(format!("write error: {}", e)))?;
+    write_trace::event(
+        "lance_write_execute_end",
+        serde_json::json!({
+            "path": path.display().to_string(),
+            "kind": format!("{:?}", kind),
+            "mode": format!("{:?}", mode),
+            "rows": original_rows,
+            "version": dataset.version().version,
+            "elapsedMs": write_trace::elapsed_ms(write_start),
+            "totalElapsedMs": write_trace::elapsed_ms(trace_start),
+        }),
+    );
 
     Ok(GraphTableVersion::new(
         graph_table_id_for_path(path),
@@ -402,8 +430,22 @@ pub(crate) async fn append_lance_batch_at_version_for_kind_with_properties(
     kind: LanceDatasetKind,
     transaction_properties: Option<HashMap<String, String>>,
 ) -> Result<GraphTableVersion> {
+    let trace_start = Instant::now();
+    let rows = batch.num_rows();
+    let convert_start = Instant::now();
     let batch = logical_batch_to_lance(&batch, kind)?;
+    write_trace::event(
+        "lance_append_convert_end",
+        serde_json::json!({
+            "path": path.display().to_string(),
+            "kind": format!("{:?}", kind),
+            "rows": rows,
+            "pinnedVersion": pinned_version.version,
+            "elapsedMs": write_trace::elapsed_ms(convert_start),
+        }),
+    );
     let uri = local_path_to_file_uri(path)?;
+    let open_start = Instant::now();
     let dataset = Dataset::open(&uri)
         .await
         .map_err(|e| NanoError::Lance(format!("append open error: {}", e)))?;
@@ -416,6 +458,16 @@ pub(crate) async fn append_lance_batch_at_version_for_kind_with_properties(
                 pinned_version.version, e
             ))
         })?;
+    write_trace::event(
+        "lance_append_open_checkout_end",
+        serde_json::json!({
+            "path": path.display().to_string(),
+            "kind": format!("{:?}", kind),
+            "rows": rows,
+            "pinnedVersion": pinned_version.version,
+            "elapsedMs": write_trace::elapsed_ms(open_start),
+        }),
+    );
     let mut params = WriteParams {
         mode: WriteMode::Append,
         enable_stable_row_ids: true,
@@ -424,11 +476,23 @@ pub(crate) async fn append_lance_batch_at_version_for_kind_with_properties(
     if let Some(properties) = transaction_properties {
         params.transaction_properties = Some(Arc::new(properties));
     }
+    let execute_start = Instant::now();
     let appended = InsertBuilder::new(Arc::new(dataset))
         .with_params(&params)
         .execute(vec![batch])
         .await
         .map_err(|e| NanoError::Lance(format!("append error: {}", e)))?;
+    write_trace::event(
+        "lance_append_execute_end",
+        serde_json::json!({
+            "path": path.display().to_string(),
+            "kind": format!("{:?}", kind),
+            "rows": rows,
+            "version": appended.version().version,
+            "elapsedMs": write_trace::elapsed_ms(execute_start),
+            "totalElapsedMs": write_trace::elapsed_ms(trace_start),
+        }),
+    );
     Ok(GraphTableVersion::new(
         graph_table_id_for_path(path),
         appended.version().version,
@@ -475,7 +539,10 @@ async fn run_lance_merge_insert_with_key_versioned_for_kind(
     key_prop: &str,
     kind: LanceDatasetKind,
 ) -> Result<GraphTableVersion> {
+    let trace_start = Instant::now();
+    let rows = source_batch.num_rows();
     let uri = local_path_to_file_uri(dataset_path)?;
+    let open_start = Instant::now();
     let dataset = Dataset::open(&uri)
         .await
         .map_err(|e| NanoError::Lance(format!("merge open error: {}", e)))?;
@@ -488,7 +555,19 @@ async fn run_lance_merge_insert_with_key_versioned_for_kind(
                 pinned_version.version, e
             ))
         })?;
+    write_trace::event(
+        "lance_merge_open_checkout_end",
+        serde_json::json!({
+            "path": dataset_path.display().to_string(),
+            "kind": format!("{:?}", kind),
+            "rows": rows,
+            "pinnedVersion": pinned_version.version,
+            "keyProp": key_prop,
+            "elapsedMs": write_trace::elapsed_ms(open_start),
+        }),
+    );
 
+    let build_start = Instant::now();
     let mut builder = MergeInsertBuilder::try_new(Arc::new(dataset), vec![key_prop.to_string()])
         .map_err(|e| NanoError::Lance(format!("merge builder error: {}", e)))?;
     builder
@@ -510,10 +589,33 @@ async fn run_lance_merge_insert_with_key_versioned_for_kind(
     let job = builder
         .try_build()
         .map_err(|e| NanoError::Lance(format!("merge build error: {}", e)))?;
+    write_trace::event(
+        "lance_merge_build_end",
+        serde_json::json!({
+            "path": dataset_path.display().to_string(),
+            "kind": format!("{:?}", kind),
+            "rows": rows,
+            "pinnedVersion": pinned_version.version,
+            "keyProp": key_prop,
+            "elapsedMs": write_trace::elapsed_ms(build_start),
+        }),
+    );
+    let execute_start = Instant::now();
     let (merged_dataset, _) = job
         .execute_reader(source)
         .await
         .map_err(|e| NanoError::Lance(format!("merge execute error: {}", e)))?;
+    write_trace::event(
+        "lance_merge_execute_end",
+        serde_json::json!({
+            "path": dataset_path.display().to_string(),
+            "kind": format!("{:?}", kind),
+            "rows": rows,
+            "version": merged_dataset.version().version,
+            "elapsedMs": write_trace::elapsed_ms(execute_start),
+            "totalElapsedMs": write_trace::elapsed_ms(trace_start),
+        }),
+    );
 
     Ok(GraphTableVersion::new(
         graph_table_id_for_path(dataset_path),
@@ -636,6 +738,7 @@ pub(crate) async fn cleanup_unpublished_manifest_versions(
 }
 
 pub(crate) async fn open_dataset_for_locator(locator: &DatasetLocator) -> Result<Dataset> {
+    let trace_start = Instant::now();
     if locator.namespace_managed {
         let namespace = open_directory_namespace(&locator.db_path).await?;
         let location = resolve_table_location(namespace, &locator.table_id).await?;
@@ -646,7 +749,7 @@ pub(crate) async fn open_dataset_for_locator(locator: &DatasetLocator) -> Result
                 locator.table_id, e
             ))
         })?;
-        return dataset
+        let checked = dataset
             .checkout_version(locator.dataset_version)
             .await
             .map_err(|e| {
@@ -654,13 +757,23 @@ pub(crate) async fn open_dataset_for_locator(locator: &DatasetLocator) -> Result
                     "namespace dataset {} version {} load error: {}",
                     locator.table_id, locator.dataset_version, e
                 ))
-            });
+            })?;
+        write_trace::event(
+            "lance_open_locator_end",
+            serde_json::json!({
+                "tableId": locator.table_id.as_str(),
+                "namespaceManaged": locator.namespace_managed,
+                "datasetVersion": locator.dataset_version,
+                "elapsedMs": write_trace::elapsed_ms(trace_start),
+            }),
+        );
+        return Ok(checked);
     } else {
         let uri = local_path_to_file_uri(&locator.dataset_path)?;
         let dataset = Dataset::open(&uri)
             .await
             .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
-        dataset
+        let checked = dataset
             .checkout_version(locator.dataset_version)
             .await
             .map_err(|e| {
@@ -668,13 +781,25 @@ pub(crate) async fn open_dataset_for_locator(locator: &DatasetLocator) -> Result
                     "checkout version {} error: {}",
                     locator.dataset_version, e
                 ))
-            })
+            })?;
+        write_trace::event(
+            "lance_open_locator_end",
+            serde_json::json!({
+                "path": locator.dataset_path.display().to_string(),
+                "tableId": locator.table_id.as_str(),
+                "namespaceManaged": locator.namespace_managed,
+                "datasetVersion": locator.dataset_version,
+                "elapsedMs": write_trace::elapsed_ms(trace_start),
+            }),
+        );
+        Ok(checked)
     }
 }
 
 pub(crate) async fn read_lance_batches_for_locator(
     locator: &DatasetLocator,
 ) -> Result<Vec<RecordBatch>> {
+    let trace_start = Instant::now();
     let dataset = open_dataset_for_locator(locator).await?;
     let kind = lance_dataset_kind_for_locator(locator);
     let projected_columns: Vec<String> = dataset
@@ -687,7 +812,7 @@ pub(crate) async fn read_lance_batches_for_locator(
     scanner
         .project(&projected_columns)
         .map_err(|e| NanoError::Lance(format!("projection error: {}", e)))?;
-    scanner
+    let batches = scanner
         .try_into_stream()
         .await
         .map_err(|e| NanoError::Lance(format!("scan error: {}", e)))?
@@ -698,7 +823,20 @@ pub(crate) async fn read_lance_batches_for_locator(
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .map(|batch| lance_batch_to_logical(&batch, kind))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    write_trace::event(
+        "lance_read_batches_end",
+        serde_json::json!({
+            "tableId": locator.table_id.as_str(),
+            "namespaceManaged": locator.namespace_managed,
+            "datasetVersion": locator.dataset_version,
+            "batches": batches.len(),
+            "rows": rows,
+            "elapsedMs": write_trace::elapsed_ms(trace_start),
+        }),
+    );
+    Ok(batches)
 }
 
 pub(crate) async fn read_lance_projected_batches_for_locator(

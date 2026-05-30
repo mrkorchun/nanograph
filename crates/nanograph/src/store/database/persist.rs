@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Cursor};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow_array::builder::BooleanBuilder;
 use arrow_array::{Array, BooleanArray, RecordBatch, UInt64Array};
@@ -53,6 +54,7 @@ use crate::store::txlog::{
     commit_graph_records_and_manifest_namespace_lineage,
 };
 use crate::store::v4_internal::merge_v4_internal_dataset_entries;
+use crate::store::write_trace;
 use crate::types::ScalarType;
 
 use super::cdc::{
@@ -569,19 +571,44 @@ async fn persist_sparse_load_string_at_path(
     mode: LoadMode,
     op_summary: &str,
 ) -> Result<()> {
+    let trace_start = Instant::now();
+    write_trace::event(
+        "sparse_load_string_start",
+        serde_json::json!({
+            "dbPath": db_path.display().to_string(),
+            "mode": format!("{:?}", mode),
+            "bytes": data_source.len(),
+            "opSummary": op_summary,
+        }),
+    );
     if matches!(mode, LoadMode::Overwrite) {
         return Err(NanoError::Storage(
             "sparse string load only supports append and merge".to_string(),
         ));
     }
 
+    let metadata_start = Instant::now();
     let metadata = DatabaseMetadata::open(db_path)?;
+    write_trace::event(
+        "sparse_load_metadata_open_end",
+        serde_json::json!({
+            "elapsedMs": write_trace::elapsed_ms(metadata_start),
+        }),
+    );
+    let restore_start = Instant::now();
     let existing_storage = build_sparse_existing_storage_for_load_reader(
         &metadata,
         Cursor::new(data_source.as_bytes()),
         mode,
     )
     .await?;
+    write_trace::event(
+        "sparse_load_restore_end",
+        serde_json::json!({
+            "elapsedMs": write_trace::elapsed_ms(restore_start),
+        }),
+    );
+    let build_start = Instant::now();
     let load_result = build_next_storage_for_load_reader_with_options(
         db_path,
         None,
@@ -592,9 +619,31 @@ async fn persist_sparse_load_string_at_path(
         false,
     )
     .await?;
+    write_trace::event(
+        "sparse_load_build_next_storage_end",
+        serde_json::json!({
+            "elapsedMs": write_trace::elapsed_ms(build_start),
+        }),
+    );
     let mut plan = load_result.plan;
     plan.op_summary = op_summary.to_string();
-    persist_dataset_mutation_plan_at_path(db_path, metadata.schema_ir(), &plan).await
+    let persist_start = Instant::now();
+    let result = persist_dataset_mutation_plan_at_path(db_path, metadata.schema_ir(), &plan).await;
+    write_trace::event(
+        "sparse_load_persist_plan_end",
+        serde_json::json!({
+            "elapsedMs": write_trace::elapsed_ms(persist_start),
+            "ok": result.is_ok(),
+        }),
+    );
+    write_trace::event(
+        "sparse_load_string_end",
+        serde_json::json!({
+            "elapsedMs": write_trace::elapsed_ms(trace_start),
+            "ok": result.is_ok(),
+        }),
+    );
+    result
 }
 
 async fn persist_sparse_load_file_at_path(
@@ -603,17 +652,42 @@ async fn persist_sparse_load_file_at_path(
     mode: LoadMode,
     op_summary: &str,
 ) -> Result<()> {
+    let trace_start = Instant::now();
+    write_trace::event(
+        "sparse_load_file_start",
+        serde_json::json!({
+            "dbPath": db_path.display().to_string(),
+            "dataPath": data_path.display().to_string(),
+            "mode": format!("{:?}", mode),
+            "opSummary": op_summary,
+        }),
+    );
     if matches!(mode, LoadMode::Overwrite) {
         return Err(NanoError::Storage(
             "sparse file load only supports append and merge".to_string(),
         ));
     }
 
+    let metadata_start = Instant::now();
     let metadata = DatabaseMetadata::open(db_path)?;
+    write_trace::event(
+        "sparse_load_metadata_open_end",
+        serde_json::json!({
+            "elapsedMs": write_trace::elapsed_ms(metadata_start),
+        }),
+    );
+    let restore_start = Instant::now();
     let existing_storage =
         build_sparse_existing_storage_for_load(&metadata, data_path, mode).await?;
+    write_trace::event(
+        "sparse_load_restore_end",
+        serde_json::json!({
+            "elapsedMs": write_trace::elapsed_ms(restore_start),
+        }),
+    );
     let file = std::fs::File::open(data_path)?;
     let reader = BufReader::new(file);
+    let build_start = Instant::now();
     let load_result = build_next_storage_for_load_reader_with_options(
         db_path,
         data_path.parent(),
@@ -624,9 +698,31 @@ async fn persist_sparse_load_file_at_path(
         false,
     )
     .await?;
+    write_trace::event(
+        "sparse_load_build_next_storage_end",
+        serde_json::json!({
+            "elapsedMs": write_trace::elapsed_ms(build_start),
+        }),
+    );
     let mut plan = load_result.plan;
     plan.op_summary = op_summary.to_string();
-    persist_dataset_mutation_plan_at_path(db_path, metadata.schema_ir(), &plan).await
+    let persist_start = Instant::now();
+    let result = persist_dataset_mutation_plan_at_path(db_path, metadata.schema_ir(), &plan).await;
+    write_trace::event(
+        "sparse_load_persist_plan_end",
+        serde_json::json!({
+            "elapsedMs": write_trace::elapsed_ms(persist_start),
+            "ok": result.is_ok(),
+        }),
+    );
+    write_trace::event(
+        "sparse_load_file_end",
+        serde_json::json!({
+            "elapsedMs": write_trace::elapsed_ms(trace_start),
+            "ok": result.is_ok(),
+        }),
+    );
+    result
 }
 
 pub async fn run_mutation_query_sparse(
@@ -1191,7 +1287,20 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
     schema_ir: &SchemaIR,
     plan: &DatasetMutationPlan,
 ) -> Result<()> {
+    let trace_start = Instant::now();
     let storage_generation = detect_storage_generation(db_path)?;
+    write_trace::event(
+        "persist_plan_start",
+        serde_json::json!({
+            "dbPath": db_path.display().to_string(),
+            "opSummary": plan.op_summary.as_str(),
+            "storageGeneration": format!("{:?}", storage_generation),
+            "nodeReplacements": plan.node_replacements.len(),
+            "edgeReplacements": plan.edge_replacements.len(),
+            "nodeDeltas": plan.delta.node_changes.len(),
+            "edgeDeltas": plan.delta.edge_changes.len(),
+        }),
+    );
     let table_store: Box<dyn TableStore> = match storage_generation {
         Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage) => {
             Box::new(V4NamespaceTableStore::new(db_path))
@@ -1270,6 +1379,16 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             && node_delta.inserts.is_none()
             && node_delta.upserts.is_none()
             && !node_delta.delete_ids.is_empty();
+        let operation = if can_merge_upsert {
+            "merge_upsert"
+        } else if can_append {
+            "append"
+        } else if can_native_delete {
+            "delete"
+        } else {
+            "overwrite"
+        };
+        let write_start = Instant::now();
         let _staged_dataset_version = if can_merge_upsert {
             let source_batch = node_delta.upserts.clone().ok_or_else(|| {
                 NanoError::Storage(format!("missing node upsert batch for {}", node_def.name))
@@ -1344,6 +1463,20 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             );
             table_store.overwrite(&dataset_path, batch).await?.version
         };
+        write_trace::event(
+            "persist_dataset_write_end",
+            serde_json::json!({
+                "kind": "node",
+                "typeName": node_def.name.as_str(),
+                "operation": operation,
+                "tableId": table_id.as_str(),
+                "rows": row_count,
+                "hasPrevious": previous_entry.is_some(),
+                "duplicateFieldNames": duplicate_field_names,
+                "elapsedMs": write_trace::elapsed_ms(write_start),
+            }),
+        );
+        let post_write_start = Instant::now();
         let manifest_dataset_rel_path = resolve_manifest_dataset_path(
             db_path,
             &table_id,
@@ -1356,6 +1489,16 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
         rebuild_node_text_indexes(&dataset_physical_path, node_def).await?;
         rebuild_node_vector_indexes(&dataset_physical_path, node_def).await?;
         let dataset_version = latest_lance_dataset_version(&dataset_physical_path).await?;
+        write_trace::event(
+            "persist_dataset_post_write_end",
+            serde_json::json!({
+                "kind": "node",
+                "typeName": node_def.name.as_str(),
+                "tableId": table_id.as_str(),
+                "datasetVersion": dataset_version,
+                "elapsedMs": write_trace::elapsed_ms(post_write_start),
+            }),
+        );
         dataset_entries.push(DatasetEntry::new(
             node_def.type_id,
             node_def.name.clone(),
@@ -1412,6 +1555,14 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
         let can_native_delete = previous_entry.is_some()
             && edge_delta.inserts.is_none()
             && !edge_delta.delete_ids.is_empty();
+        let operation = if can_append {
+            "append"
+        } else if can_native_delete {
+            "delete"
+        } else {
+            "overwrite"
+        };
+        let write_start = Instant::now();
         let dataset_version = if can_append {
             let delta_batch = edge_delta.inserts.clone().ok_or_else(|| {
                 NanoError::Storage(format!("missing edge insert batch for {}", edge_def.name))
@@ -1457,6 +1608,20 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             );
             table_store.overwrite(&dataset_path, batch).await?.version
         };
+        write_trace::event(
+            "persist_dataset_write_end",
+            serde_json::json!({
+                "kind": "edge",
+                "typeName": edge_def.name.as_str(),
+                "operation": operation,
+                "tableId": table_id.as_str(),
+                "rows": row_count,
+                "hasPrevious": previous_entry.is_some(),
+                "duplicateFieldNames": duplicate_field_names,
+                "elapsedMs": write_trace::elapsed_ms(write_start),
+            }),
+        );
+        let post_write_start = Instant::now();
         let manifest_dataset_rel_path = resolve_manifest_dataset_path(
             db_path,
             &table_id,
@@ -1464,6 +1629,16 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             storage_generation,
         )
         .await?;
+        write_trace::event(
+            "persist_dataset_post_write_end",
+            serde_json::json!({
+                "kind": "edge",
+                "typeName": edge_def.name.as_str(),
+                "tableId": table_id.as_str(),
+                "datasetVersion": dataset_version,
+                "elapsedMs": write_trace::elapsed_ms(post_write_start),
+            }),
+        );
         dataset_entries.push(DatasetEntry::new(
             edge_def.type_id,
             edge_def.name.clone(),
@@ -1536,13 +1711,30 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             &plan.delta,
         )
         .await?;
+        let commit_start = Instant::now();
         commit_graph_records_and_manifest_namespace_lineage(
             db_path,
             &graph_commit,
             &graph_deletes,
             &manifest,
         )?;
+        write_trace::event(
+            "persist_plan_commit_end",
+            serde_json::json!({
+                "storageGeneration": format!("{:?}", storage_generation),
+                "graphVersion": manifest.db_version,
+                "graphChanges": 0,
+                "graphDeletes": graph_deletes.len(),
+                "elapsedMs": write_trace::elapsed_ms(commit_start),
+            }),
+        );
         super::maintenance::cleanup_stale_dirs(db_path, &manifest)?;
+        write_trace::event(
+            "persist_plan_end",
+            serde_json::json!({
+                "elapsedMs": write_trace::elapsed_ms(trace_start),
+            }),
+        );
         return Ok(());
     }
 
@@ -1570,7 +1762,18 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
         populate_delete_graph_change_rowids_from_committed_snapshot(db_path, &mut graph_changes)
             .await?;
     }
+    let commit_start = Instant::now();
     commit_graph_records_and_manifest(db_path, &graph_commit, &graph_changes, &manifest)?;
+    write_trace::event(
+        "persist_plan_commit_end",
+        serde_json::json!({
+            "storageGeneration": format!("{:?}", storage_generation),
+            "graphVersion": manifest.db_version,
+            "graphChanges": graph_changes.len(),
+            "graphDeletes": 0,
+            "elapsedMs": write_trace::elapsed_ms(commit_start),
+        }),
+    );
     if !matches!(storage_generation, Some(StorageGeneration::V4Namespace)) {
         if let Err(err) = rebuild_graph_mirror_from_wal(db_path).await {
             warn!(
@@ -1582,6 +1785,12 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
     }
 
     super::maintenance::cleanup_stale_dirs(db_path, &manifest)?;
+    write_trace::event(
+        "persist_plan_end",
+        serde_json::json!({
+            "elapsedMs": write_trace::elapsed_ms(trace_start),
+        }),
+    );
     Ok(())
 }
 
@@ -1605,9 +1814,26 @@ async fn build_sparse_existing_storage_for_load_reader<R: BufRead>(
     reader: R,
     mode: LoadMode,
 ) -> Result<DatasetAccumulator> {
+    let collect_start = Instant::now();
     let incoming_types = collect_incoming_load_types(metadata, reader)?;
+    write_trace::event(
+        "sparse_load_collect_incoming_types_end",
+        serde_json::json!({
+            "elapsedMs": write_trace::elapsed_ms(collect_start),
+            "incomingNodeTypes": incoming_types.node_types.len(),
+            "incomingEdgeTypes": incoming_types.edge_types.len(),
+        }),
+    );
     let (required_node_types, required_edge_types) =
         sparse_load_restore_scope(metadata.schema_ir(), &incoming_types, mode)?;
+    write_trace::event(
+        "sparse_load_restore_scope",
+        serde_json::json!({
+            "mode": format!("{:?}", mode),
+            "requiredNodeTypes": required_node_types.len(),
+            "requiredEdgeTypes": required_edge_types.len(),
+        }),
+    );
     restore_sparse_existing_storage(metadata, &required_node_types, &required_edge_types).await
 }
 
@@ -1708,6 +1934,7 @@ async fn restore_sparse_existing_storage(
     node_types: &HashSet<String>,
     edge_types: &HashSet<String>,
 ) -> Result<DatasetAccumulator> {
+    let trace_start = Instant::now();
     let mut storage = DatasetAccumulator::new(metadata.catalog().clone());
     storage.set_next_node_id(metadata.manifest().next_node_id);
     storage.set_next_edge_id(metadata.manifest().next_edge_id);
@@ -1720,7 +1947,21 @@ async fn restore_sparse_existing_storage(
         };
         let dataset_path = locator.dataset_path.clone();
         let dataset_version = locator.dataset_version;
+        let read_start = Instant::now();
         let batches = read_lance_batches_for_locator(&locator).await?;
+        let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        write_trace::event(
+            "sparse_restore_dataset_read_end",
+            serde_json::json!({
+                "kind": "node",
+                "typeName": type_name.as_str(),
+                "tableId": locator.table_id.as_str(),
+                "datasetVersion": dataset_version,
+                "batches": batches.len(),
+                "rows": rows,
+                "elapsedMs": write_trace::elapsed_ms(read_start),
+            }),
+        );
         for batch in batches {
             storage.load_node_batch(&type_name, batch)?;
         }
@@ -1734,12 +1975,34 @@ async fn restore_sparse_existing_storage(
         let Some(locator) = metadata.edge_dataset_locator(&type_name) else {
             continue;
         };
+        let read_start = Instant::now();
         let batches = read_lance_batches_for_locator(&locator).await?;
+        let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        write_trace::event(
+            "sparse_restore_dataset_read_end",
+            serde_json::json!({
+                "kind": "edge",
+                "typeName": type_name.as_str(),
+                "tableId": locator.table_id.as_str(),
+                "datasetVersion": locator.dataset_version,
+                "batches": batches.len(),
+                "rows": rows,
+                "elapsedMs": write_trace::elapsed_ms(read_start),
+            }),
+        );
         for batch in batches {
             storage.load_edge_batch(&type_name, batch)?;
         }
     }
 
+    write_trace::event(
+        "sparse_restore_storage_end",
+        serde_json::json!({
+            "nodeTypes": node_types.len(),
+            "edgeTypes": edge_types.len(),
+            "elapsedMs": write_trace::elapsed_ms(trace_start),
+        }),
+    );
     Ok(storage)
 }
 

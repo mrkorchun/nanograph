@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -25,6 +26,7 @@ use crate::store::namespace::{
     open_directory_namespace, resolve_or_declare_table_location,
 };
 use crate::store::v4_graph_log::{stage_graph_change_records, stage_graph_commit_record};
+use crate::store::write_trace;
 
 pub(crate) trait NamespaceCommitAdapter: Send + Sync {
     fn commit_graph_update(
@@ -250,11 +252,23 @@ async fn build_graph_update_bundle_async(
     graph_changes: &[GraphChangeRecord],
     manifest: &GraphManifest,
 ) -> Result<GraphCommitBundle> {
+    let trace_start = Instant::now();
     let mut next_snapshot = manifest.clone();
     let mut staged_entries = Vec::new();
+    let resolve_start = Instant::now();
     let resolved_changes = resolve_graph_change_row_ids(db_dir, manifest, graph_changes).await?;
+    write_trace::event(
+        "namespace_commit_resolve_changes_end",
+        serde_json::json!({
+            "graphVersion": graph_commit.graph_version.value(),
+            "graphChanges": graph_changes.len(),
+            "resolvedChanges": resolved_changes.len(),
+            "elapsedMs": write_trace::elapsed_ms(resolve_start),
+        }),
+    );
 
     if !resolved_changes.is_empty() {
+        let stage_changes_start = Instant::now();
         staged_entries.push(
             stage_graph_change_records(
                 db_dir,
@@ -266,12 +280,42 @@ async fn build_graph_update_bundle_async(
             )
             .await?,
         );
+        write_trace::event(
+            "namespace_commit_stage_changes_end",
+            serde_json::json!({
+                "graphVersion": graph_commit.graph_version.value(),
+                "graphChanges": resolved_changes.len(),
+                "elapsedMs": write_trace::elapsed_ms(stage_changes_start),
+            }),
+        );
     }
 
+    let stage_tx_start = Instant::now();
     staged_entries.push(stage_graph_commit_record(db_dir, &next_snapshot, graph_commit).await?);
+    write_trace::event(
+        "namespace_commit_stage_tx_end",
+        serde_json::json!({
+            "graphVersion": graph_commit.graph_version.value(),
+            "elapsedMs": write_trace::elapsed_ms(stage_tx_start),
+        }),
+    );
     replace_staged_graph_log_entries(&mut next_snapshot, &staged_entries);
 
-    build_snapshot_bundle_with_staged_entries_async(db_dir, &next_snapshot, &staged_entries).await
+    let bundle_start = Instant::now();
+    let bundle =
+        build_snapshot_bundle_with_staged_entries_async(db_dir, &next_snapshot, &staged_entries)
+            .await;
+    write_trace::event(
+        "namespace_commit_build_bundle_end",
+        serde_json::json!({
+            "graphVersion": graph_commit.graph_version.value(),
+            "stagedEntries": staged_entries.len(),
+            "ok": bundle.is_ok(),
+            "elapsedMs": write_trace::elapsed_ms(bundle_start),
+            "totalElapsedMs": write_trace::elapsed_ms(trace_start),
+        }),
+    );
+    bundle
 }
 
 async fn resolve_graph_change_row_ids(
@@ -476,7 +520,16 @@ async fn build_snapshot_bundle_with_staged_entries_async(
     snapshot: &GraphManifest,
     staged_entries: &[StagedNamespaceTable],
 ) -> Result<GraphCommitBundle> {
+    let trace_start = Instant::now();
+    let stage_snapshot_start = Instant::now();
     let staged_snapshot = stage_graph_snapshot_entry(db_dir, snapshot).await?;
+    write_trace::event(
+        "namespace_commit_stage_snapshot_end",
+        serde_json::json!({
+            "graphVersion": snapshot.db_version,
+            "elapsedMs": write_trace::elapsed_ms(stage_snapshot_start),
+        }),
+    );
     let mut staged_entries_by_id = HashMap::new();
     for staged in staged_entries {
         staged_entries_by_id.insert(
@@ -486,6 +539,7 @@ async fn build_snapshot_bundle_with_staged_entries_async(
     }
 
     let mut published_versions = Vec::new();
+    let published_lookup_start = Instant::now();
     for entry in &snapshot.datasets {
         let table_id = entry.effective_table_id();
         if let Some(staged) = staged_entries_by_id.get(table_id) {
@@ -500,6 +554,16 @@ async fn build_snapshot_bundle_with_staged_entries_async(
     }
     published_versions.push(staged_snapshot.published_version.clone());
     dedup_namespace_published_versions(&mut published_versions);
+    write_trace::event(
+        "namespace_commit_published_lookup_end",
+        serde_json::json!({
+            "graphVersion": snapshot.db_version,
+            "datasets": snapshot.datasets.len(),
+            "stagedEntries": staged_entries.len(),
+            "publishedVersions": published_versions.len(),
+            "elapsedMs": write_trace::elapsed_ms(published_lookup_start),
+        }),
+    );
 
     let mut internal_entries = snapshot
         .datasets
@@ -521,6 +585,13 @@ async fn build_snapshot_bundle_with_staged_entries_async(
         internal_entries,
     };
     bundle.validate()?;
+    write_trace::event(
+        "namespace_commit_snapshot_bundle_end",
+        serde_json::json!({
+            "graphVersion": snapshot.db_version,
+            "elapsedMs": write_trace::elapsed_ms(trace_start),
+        }),
+    );
     Ok(bundle)
 }
 
