@@ -35,9 +35,6 @@ function log(event: string, fields: Fields = {}): void {
 }
 
 function commandName(name: string): string {
-  if (process.platform === "win32" && (name === "npm" || name === "npx")) {
-    return `${name}.cmd`;
-  }
   return name;
 }
 
@@ -63,6 +60,7 @@ function run(
     cwd,
     env: { ...process.env, ...env },
     encoding: "utf8",
+    shell: process.platform === "win32" && (command === "npm" || command === "npx"),
     stdio: ["ignore", "pipe", "pipe"]
   });
 
