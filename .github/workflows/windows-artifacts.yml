@@ -5,6 +5,12 @@ on:
     branches:
       - public-windows-artifacts
   workflow_dispatch:
+    inputs:
+      include_debug:
+        description: Build debug TS diagnostics too
+        required: false
+        default: "false"
+        type: boolean
 
 permissions:
   contents: read
@@ -75,7 +81,12 @@ jobs:
         env:
           CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
           NPM_CACHE_HIT: ${{ steps.npm-cache.outputs.cache-hit }}
-        run: node --experimental-strip-types tools/ci/windows-artifacts.ts all
+        run: |
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch' -and '${{ inputs.include_debug }}' -eq 'true') {
+            node --experimental-strip-types tools/ci/windows-artifacts.ts all
+          } else {
+            node --experimental-strip-types tools/ci/windows-artifacts.ts release
+          }
 
       - name: Upload release CLI
         uses: actions/upload-artifact@v4
@@ -94,7 +105,7 @@ jobs:
           retention-days: 14
 
       - name: Upload debug diagnostics
-        if: always()
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.include_debug
         uses: actions/upload-artifact@v4
         with:
           name: nanograph-windows-debug-diagnostics

@@ -280,6 +280,20 @@ async function all(): Promise<void> {
   });
 }
 
+async function release(): Promise<void> {
+  await recordEnvironment();
+  await installNpm();
+  await buildCliRelease();
+  await packageCliRelease();
+  await buildTs("release");
+  await packageTs("release");
+  log("done", {
+    expected: "release artifacts are usable",
+    hypothesis: "debug artifact is only needed for crash/backtrace investigations",
+    artifactRoot
+  });
+}
+
 const command = process.argv[2] ?? "all";
 main(command).catch((error: Error) => {
   log("phase-error", {
@@ -296,6 +310,9 @@ async function main(command: string): Promise<void> {
   switch (command) {
     case "all":
       await all();
+      break;
+    case "release":
+      await release();
       break;
     case "record-env":
       await recordEnvironment();
